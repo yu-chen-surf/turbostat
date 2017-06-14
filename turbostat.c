@@ -189,12 +189,12 @@ struct pkg_data {
 	long long gfx_rc6_ms;
 	unsigned int gfx_mhz;
 	unsigned int package_id;
-	unsigned int energy_pkg;	/* MSR_PKG_ENERGY_STATUS */
-	unsigned int energy_dram;	/* MSR_DRAM_ENERGY_STATUS */
-	unsigned int energy_cores;	/* MSR_PP0_ENERGY_STATUS */
-	unsigned int energy_gfx;	/* MSR_PP1_ENERGY_STATUS */
-	unsigned int rapl_pkg_perf_status;	/* MSR_PKG_PERF_STATUS */
-	unsigned int rapl_dram_perf_status;	/* MSR_DRAM_PERF_STATUS */
+	unsigned long long energy_pkg;	/* MSR_PKG_ENERGY_STATUS */
+	unsigned long long energy_dram;	/* MSR_DRAM_ENERGY_STATUS */
+	unsigned long long energy_cores;	/* MSR_PP0_ENERGY_STATUS */
+	unsigned long long energy_gfx;	/* MSR_PP1_ENERGY_STATUS */
+	unsigned long long rapl_pkg_perf_status;	/* MSR_PKG_PERF_STATUS */
+	unsigned long long rapl_dram_perf_status;	/* MSR_DRAM_PERF_STATUS */
 	unsigned int pkg_temp_c;
 	unsigned long long counter[MAX_ADDED_COUNTERS];
 } *package_even, *package_odd;
@@ -227,6 +227,96 @@ struct msr_counter {
 #define	FLAGS_SHOW	(1 << 1)
 #define	SYSFS_PERCPU	(1 << 1)
 };
+
+/*
+ * Reliable msr is defined as a monotone increasing msr,
+ * which means that we maintain a local copy of the msrs that,
+ * these cached msrs will increase monotonously even if the
+ * corresponding msr register is 32bits.
+ *
+ * According to the SDM 14.9.3:
+ * MSR_PKG_ENERGY_STATUS has a wraparound time of around
+ * 60 secs when power consumption is high, and may
+ * be longer otherwise. So we use 30 second as the timeout
+ * to guarantee that there is always a timeout before every
+ * wrap around on 32bit msrs.
+ */
+#define SAMPLE_MSEC	(30 * 1000)
+
+/* Helper structure for msr reliable support. */
+struct msr_map {
+	int idx;
+	int offset;
+	int flag;
+};
+
+/* Helper mapping to index into the msr_reliable array. */
+struct msr_map msr_reliable_map[] = {
+	{0, MSR_PKG_ENERGY_STATUS, RAPL_PKG},
+	{1, MSR_DRAM_ENERGY_STATUS, RAPL_DRAM},
+	{2, MSR_PP0_ENERGY_STATUS, RAPL_CORES_ENERGY_STATUS},
+	{3, MSR_PP1_ENERGY_STATUS, RAPL_GFX},
+	{4, MSR_PKG_PERF_STATUS, RAPL_PKG_PERF_STATUS},
+	{5, MSR_DRAM_PERF_STATUS, RAPL_DRAM_PERF_STATUS},
+};
+
+#define RELIABLE_MSR_NUM	(sizeof(msr_reliable_map)/sizeof(msr_reliable_map[0]))
+
+struct msr_element {
+	unsigned long long cur;
+	unsigned long long last;
+};
+
+struct msr_array {
+	struct msr_element e[RELIABLE_MSR_NUM];
+};
+
+/* The reliable msr array.  */
+struct msr_array *msr_reliable;
+
+/*
+ * Helper function to get the index
+ * of the element in the msr_reliable
+ * array according to the msr register
+ * offset.
+ */
+static int offset_to_idx(off_t offset)
+{
+	int len, i;
+
+	len = sizeof(msr_reliable_map)/sizeof(msr_reliable_map[0]);
+	for (i = 0; i < len; i++) {
+		if (msr_reliable_map[i].offset == offset)
+			return msr_reliable_map[i].idx;
+	}
+	return -1;
+}
+
+/*
+ * Helper function to get the msr
+ * register offset of the element
+ * in the msr_reliable array according
+ * to the index.
+ */
+static int idx_to_offset(int idx)
+{
+	int len, i;
+
+	len = sizeof(msr_reliable_map)/sizeof(msr_reliable_map[0]);
+	for (i = 0; i < len; i++) {
+		if (msr_reliable_map[i].idx == idx)
+			return msr_reliable_map[i].offset;
+	}
+	return -1;
+}
+
+/* Check if the corresponding reliable msr register is valid. */
+static int idx_valid(int idx)
+{
+	return (do_rapl & msr_reliable_map[idx].flag) ? 1 : 0;
+}
+
+int get_msr_reliable(int cpu, off_t offset, unsigned long long *msr);
 
 struct sys_counters {
 	unsigned int added_thread_counters;
@@ -724,13 +814,13 @@ int dump_counters(struct thread_data *t, struct core_data *c,
 		outp += sprintf(outp, "pc8: %016llX\n", p->pc8);
 		outp += sprintf(outp, "pc9: %016llX\n", p->pc9);
 		outp += sprintf(outp, "pc10: %016llX\n", p->pc10);
-		outp += sprintf(outp, "Joules PKG: %0X\n", p->energy_pkg);
-		outp += sprintf(outp, "Joules COR: %0X\n", p->energy_cores);
-		outp += sprintf(outp, "Joules GFX: %0X\n", p->energy_gfx);
-		outp += sprintf(outp, "Joules RAM: %0X\n", p->energy_dram);
-		outp += sprintf(outp, "Throttle PKG: %0X\n",
+		outp += sprintf(outp, "Joules PKG: %016llX\n", p->energy_pkg);
+		outp += sprintf(outp, "Joules COR: %016llX\n", p->energy_cores);
+		outp += sprintf(outp, "Joules GFX: %016llX\n", p->energy_gfx);
+		outp += sprintf(outp, "Joules RAM: %016llX\n", p->energy_dram);
+		outp += sprintf(outp, "Throttle PKG: %016llX\n",
 			p->rapl_pkg_perf_status);
-		outp += sprintf(outp, "Throttle RAM: %0X\n",
+		outp += sprintf(outp, "Throttle RAM: %016llX\n",
 			p->rapl_dram_perf_status);
 		outp += sprintf(outp, "PTM: %dC\n", p->pkg_temp_c);
 
@@ -1025,8 +1115,9 @@ void format_all_counters(struct thread_data *t, struct core_data *c, struct pkg_
 	for_all_cpus(format_counters, t, c, p);
 }
 
+/* As the paramers might be 64bits, return 0 if new equals old. */
 #define DELTA_WRAP32(new, old)			\
-	if (new > old) {			\
+	if (new >= old) {			\
 		old = new - old;		\
 	} else {				\
 		old = 0x100000000 + new - old;	\
@@ -1643,34 +1734,34 @@ retry:
 			return -13;
 
 	if (do_rapl & RAPL_PKG) {
-		if (get_msr(cpu, MSR_PKG_ENERGY_STATUS, &msr))
+		if (get_msr_reliable(cpu, MSR_PKG_ENERGY_STATUS, &msr))
 			return -13;
-		p->energy_pkg = msr & 0xFFFFFFFF;
+		p->energy_pkg = msr;
 	}
 	if (do_rapl & RAPL_CORES_ENERGY_STATUS) {
-		if (get_msr(cpu, MSR_PP0_ENERGY_STATUS, &msr))
+		if (get_msr_reliable(cpu, MSR_PP0_ENERGY_STATUS, &msr))
 			return -14;
-		p->energy_cores = msr & 0xFFFFFFFF;
+		p->energy_cores = msr;
 	}
 	if (do_rapl & RAPL_DRAM) {
-		if (get_msr(cpu, MSR_DRAM_ENERGY_STATUS, &msr))
+		if (get_msr_reliable(cpu, MSR_DRAM_ENERGY_STATUS, &msr))
 			return -15;
-		p->energy_dram = msr & 0xFFFFFFFF;
+		p->energy_dram = msr;
 	}
 	if (do_rapl & RAPL_GFX) {
-		if (get_msr(cpu, MSR_PP1_ENERGY_STATUS, &msr))
+		if (get_msr_reliable(cpu, MSR_PP1_ENERGY_STATUS, &msr))
 			return -16;
-		p->energy_gfx = msr & 0xFFFFFFFF;
+		p->energy_gfx = msr;
 	}
 	if (do_rapl & RAPL_PKG_PERF_STATUS) {
-		if (get_msr(cpu, MSR_PKG_PERF_STATUS, &msr))
+		if (get_msr_reliable(cpu, MSR_PKG_PERF_STATUS, &msr))
 			return -16;
-		p->rapl_pkg_perf_status = msr & 0xFFFFFFFF;
+		p->rapl_pkg_perf_status = msr;
 	}
 	if (do_rapl & RAPL_DRAM_PERF_STATUS) {
-		if (get_msr(cpu, MSR_DRAM_PERF_STATUS, &msr))
+		if (get_msr_reliable(cpu, MSR_DRAM_PERF_STATUS, &msr))
 			return -16;
-		p->rapl_dram_perf_status = msr & 0xFFFFFFFF;
+		p->rapl_dram_perf_status = msr;
 	}
 	if (DO_BIC(BIC_PkgTmp)) {
 		if (get_msr(cpu, MSR_IA32_PACKAGE_THERM_STATUS, &msr))
@@ -2515,6 +2606,99 @@ int snapshot_proc_sysfs_files(void)
 		snapshot_gfx_mhz();
 
 	return 0;
+}
+
+int get_msr_reliable(int cpu, off_t offset, unsigned long long *msr)
+{
+	int ret, idx;
+	unsigned long long msr_tmp, msr_cur, msr_last;
+
+	ret = get_msr(cpu, offset, &msr_tmp);
+	if (ret)
+		return ret;
+
+	/* msr_reliable is updated periodically, before wrapped around. */
+	idx = offset_to_idx(offset);
+	if (idx == -1)
+		return -1;
+	msr_cur = msr_reliable[cpu].e[idx].cur;
+	msr_last = msr_reliable[cpu].e[idx].last;
+	DELTA_WRAP32(msr_tmp, msr_last);
+
+	*msr = msr_last + msr_cur;
+
+	return 0;
+}
+
+/* Timer callback, update the reliable msrs periodically. */
+static int update_reliable_msr(struct thread_data *t, struct core_data *c, struct pkg_data *p)
+{
+	int i, ret;
+	int cpu = t->cpu_id;
+
+	for (i = 0; i < RELIABLE_MSR_NUM; i++) {
+		unsigned long long msr_tmp, msr_last;
+
+		if (!idx_valid(i))
+			continue;
+		ret = get_msr(cpu, idx_to_offset(i), &msr_tmp);
+		if (ret)
+			return ret;
+
+		msr_last = msr_reliable[cpu].e[i].last;
+		msr_reliable[cpu].e[i].last = msr_tmp & 0xffffffff;
+		DELTA_WRAP32(msr_tmp, msr_last);
+		msr_reliable[cpu].e[i].cur += msr_last;
+	}
+	return 0;
+}
+
+timer_t timerid;
+
+static void
+reliable_handler(union sigval v)
+{
+	for_all_cpus(update_reliable_msr, EVEN_COUNTERS);
+}
+
+void reliable_record_start(void)
+{
+	struct itimerspec its;
+	struct sigevent sev;
+
+	msr_reliable = calloc(topo.max_cpu_num + 1, sizeof(struct msr_array));
+	if (!msr_reliable) {
+		fprintf(outf, "Can not allocate memory for msr_reliable.\n");
+		return;
+	}
+	/*
+	 * Signal handler might be restricted, so use thread notify instead.
+	 */
+	memset(&sev, 0, sizeof(struct sigevent));
+	sev.sigev_notify = SIGEV_THREAD;
+	sev.sigev_notify_function = reliable_handler;
+
+	sev.sigev_value.sival_ptr = &timerid;
+	if (timer_create(CLOCK_REALTIME, &sev, &timerid) == -1) {
+		fprintf(outf, "Can not create timer.\n");
+		goto release_msr;
+	}
+
+	its.it_value.tv_sec = 0;
+	its.it_value.tv_nsec = 1;
+	its.it_interval.tv_sec = SAMPLE_MSEC / 1000;
+	its.it_interval.tv_nsec = (SAMPLE_MSEC % 1000) * 1000000;
+
+	if (timer_settime(timerid, 0, &its, NULL) == -1) {
+		fprintf(outf, "Can not set timer.\n");
+		goto release_timer;
+	}
+	return;
+
+ release_timer:
+	timer_delete(timerid);
+ release_msr:
+	free(msr_reliable);
 }
 
 void turbostat_loop()
@@ -5052,6 +5236,7 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	reliable_record_start();
 	/*
 	 * if any params left, it must be a command to fork
 	 */
