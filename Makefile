@@ -11,6 +11,7 @@ turbostat : turbostat.c
 CFLAGS +=	-Wall
 CFLAGS +=	-DMSRHEADER='"../../../../arch/x86/include/asm/msr-index.h"'
 CFLAGS +=	-DINTEL_FAMILY_HEADER='"../../../../arch/x86/include/asm/intel-family.h"'
+# For posix timer
 EXTRACFLAGS += -lrt
 
 %: %.c
